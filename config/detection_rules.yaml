@@ -1,0 +1,86 @@
+# BYNNΛI - AutomatonSec (https://github.com/BYNNAI/AutomatonSec)
+# Detection Rules Configuration
+
+reentrancy:
+  enabled: true
+  severity: CRITICAL
+  check_cross_contract: true
+  max_depth: 5
+  patterns:
+    - external_call_before_state_change
+    - call_value_transfer
+    - delegatecall_reentrancy
+
+flashloan:
+  enabled: true
+  severity: CRITICAL
+  detect_arbitrage: true
+  check_liquidity_pools: true
+  minimum_profit_threshold: 1000
+
+access_control:
+  enabled: true
+  severity: HIGH
+  check_modifiers: true
+  check_constructors: true
+  check_delegatecall: true
+  patterns:
+    - missing_access_control
+    - tx_origin_auth
+    - weak_randomness
+
+integer_issues:
+  enabled: true
+  severity: HIGH
+  check_overflow: true
+  check_underflow: true
+  check_division_by_zero: true
+  safe_math_detection: true
+
+oracle_manipulation:
+  enabled: true
+  severity: CRITICAL
+  check_timestamp: true
+  check_price_feeds: true
+  check_twap: true
+  minimum_observation_window: 600
+
+frontrunning:
+  enabled: true
+  severity: MEDIUM
+  check_mev: true
+  check_slippage: true
+  minimum_value_threshold: 100
+
+delegatecall:
+  enabled: true
+  severity: CRITICAL
+  check_proxy_patterns: true
+  check_storage_collision: true
+  check_uninitialized: true
+
+selfdestruct:
+  enabled: true
+  severity: HIGH
+  check_unprotected: true
+  check_arbitrary_address: true
+
+unchecked_calls:
+  enabled: true
+  severity: MEDIUM
+  check_return_values: true
+  check_send_transfer: true
+
+logic_bugs:
+  enabled: true
+  severity: CRITICAL
+  check_defi_invariants: true
+  check_slippage_protection: true
+  check_fee_manipulation: true
+
+state_variables:
+  enabled: true
+  severity: LOW
+  check_shadowing: true
+  check_uninitialized: true
+  check_unused: true

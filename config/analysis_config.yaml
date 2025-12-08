@@ -1,0 +1,84 @@
+# BYNNΛI - AutomatonSec (https://github.com/BYNNAI/AutomatonSec)
+# Analysis Engine Configuration
+
+engine:
+  version: "1.0.0"
+  parallel_workers: 8
+  timeout: 300
+  max_memory_mb: 4096
+
+symbolic_execution:
+  enabled: true
+  max_depth: 10
+  max_paths: 1000
+  solver_timeout: 30
+  use_optimizations: true
+  path_pruning: true
+  constraint_caching: true
+  solver: "z3"
+
+data_flow:
+  enabled: true
+  inter_procedural: true
+  cross_contract: true
+  taint_sources:
+    - msg.sender
+    - msg.value
+    - tx.origin
+    - block.timestamp
+    - block.number
+  taint_sinks:
+    - call
+    - delegatecall
+    - transfer
+    - send
+    - selfdestruct
+
+fuzzing:
+  enabled: true
+  iterations: 10000
+  mutation_rate: 0.3
+  profit_guided: true
+  coverage_guided: true
+  seed_pool_size: 100
+  max_transaction_sequence: 10
+  gas_limit: 30000000
+
+machine_learning:
+  enabled: true
+  model_type: "transformer"
+  anomaly_threshold: 0.85
+  use_pretrained: false
+  embedding_dim: 768
+  batch_size: 32
+
+control_flow:
+  build_cfg: true
+  detect_loops: true
+  analyze_branches: true
+  max_loop_iterations: 100
+
+reporting:
+  format: "json"
+  include_source: true
+  include_exploits: true
+  confidence_threshold: 0.7
+  severity_levels:
+    - CRITICAL
+    - HIGH
+    - MEDIUM
+    - LOW
+    - INFO
+
+optimizations:
+  cache_results: true
+  incremental_analysis: true
+  parallel_detectors: true
+  smart_scheduling: true
+
+logging:
+  level: "INFO"
+  file: "logs/automatonsec.log"
+  console: true
+  max_size_mb: 100
+  backup_count: 5

@@ -1,0 +1,49 @@
+# BYNNΛI - AutomatonSec (https://github.com/BYNNAI/AutomatonSec)
+
+# Core Dependencies
+z3-solver>=4.13.0.0
+py-solc-x>=2.0.3
+web3>=6.15.1
+eth-abi>=5.0.1
+eth-utils>=4.1.1
+
+# Analysis & Parsing
+slither-analyzer>=0.10.0
+crytic-compile>=0.3.6
+pyevmasm>=0.2.3
+
+# Machine Learning
+torch>=2.2.0
+transformers>=4.37.2
+scikit-learn>=1.4.0
+numpy>=1.26.4
+scipy>=1.12.0
+
+# Graph & Data Structures
+networkx>=3.2.1
+
+# Utilities
+pyyaml>=6.0.1
+click>=8.1.7
+rich>=13.7.0
+tqdm>=4.66.1
+colorama>=0.4.6
+
+# Parallel Processing
+joblib>=1.3.2
+
+# Database & Caching
+sqlalchemy>=2.0.25
+
+# API & Web
+fastapi>=0.109.2
+uvicorn>=0.27.1
+pydantic>=2.6.1
+
+# Testing & Development
+pytest>=8.0.0
+pytest-cov>=4.1.0
+black>=24.2.0
+
+# Logging
+loguru>=0.7.2
