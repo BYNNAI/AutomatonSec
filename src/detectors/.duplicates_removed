@@ -1,0 +1,17 @@
+# Duplicate Stub Files Removed
+
+The following duplicate stub files have been removed from src/detectors/.
+Production versions exist in src/detectors/advanced/
+
+Removed files:
+1. callback_reentrancy_detector.py (stub) - production: advanced/callback_reentrancy_analyzer.py
+2. governance_attack_detector.py (stub) - production: advanced/governance_attack_analyzer.py
+3. price_manipulation_detector.py (stub) - production: advanced/price_manipulation_analyzer.py
+4. read_only_reentrancy_detector.py (stub) - production: advanced/read_only_reentrancy_analyzer.py
+5. rounding_error_detector.py (stub) - production: advanced/rounding_error_analyzer.py
+6. storage_collision_detector.py (stub) - production: advanced/storage_collision_analyzer.py
+7. unchecked_return_detector.py (stub) - production: advanced/unchecked_return_analyzer.py
+8. unsafe_cast_detector.py (stub) - production: advanced/unsafe_cast_analyzer.py
+9. vault_inflation_detector.py (stub) - production: advanced/vault_inflation_analyzer.py
+
+Cleanup completed: December 9, 2025
