@@ -12,37 +12,25 @@ logger = logging.getLogger(__name__)
 class CallbackReentrancyAnalyzer:
     """
     Production-grade callback reentrancy detector.
+    Real-world: ERC721/ERC1155 callback exploits
     Target accuracy: 70-80%
-    
-    Detects reentrancy through:
-    - ERC721 onERC721Received
-    - ERC1155 onERC1155Received
-    - onTokenReceived callbacks
-    - Custom callback patterns
     """
 
     def __init__(self):
-        self.callback_functions: Set[str] = set()
-        self.external_calls: List[Dict] = []
+        self.callback_triggers: List[Dict] = []
         self.state_changes: List[Dict] = []
+        self.vulnerable_flows: List[Dict] = []
         
-        # Known callback patterns
-        self.callback_patterns = [
-            'onerc721received',
-            'onerc1155received',
-            'onerc1155batchreceived',
-            'ontokenreceived',
-            'tokentopayingtoken',
-            'tokenfallback',
-            'receive',
-            'fallback'
+        # Known callback functions
+        self.callback_functions = [
+            'onerc721received', 'onerc1155received', 'onerc1155batchreceived',
+            'tokenfallback', 'tokensreceived', 'receive', 'fallback'
         ]
         
-        # Safe transfer methods that trigger callbacks
-        self.callback_triggers = [
-            'safetransferfrom',
-            'safemint',
-            'safebatchTransferFrom'
+        # Functions that trigger callbacks
+        self.callback_triggers_methods = [
+            'safetransfer', 'safetransferfrom', 'safemint',
+            'mint', 'transfer', 'send'
         ]
 
     def detect(self, bytecode_analysis: Dict, cfg: Dict,
@@ -50,40 +38,17 @@ class CallbackReentrancyAnalyzer:
                 fuzzing_results: Dict) -> List[Vulnerability]:
         vulnerabilities = []
         
-        # Phase 1: Identify callback functions
-        self._identify_callbacks(bytecode_analysis)
+        self._identify_callback_triggers(symbolic_results)
+        self._identify_state_changes(symbolic_results)
+        self._analyze_callback_flows(cfg, symbolic_results)
         
-        # Phase 2: Find external calls that trigger callbacks
-        self._find_callback_triggers(symbolic_results)
-        
-        # Phase 3: Track state changes
-        self._track_state_changes(symbolic_results)
-        
-        # Phase 4: Analyze reentrancy patterns
-        reentrancy_patterns = self._analyze_reentrancy_patterns(cfg, symbolic_results)
-        
-        for pattern in reentrancy_patterns:
-            vuln = self._create_vulnerability(pattern)
+        for flow in self.vulnerable_flows:
+            vuln = self._create_vulnerability(flow)
             vulnerabilities.append(vuln)
         
         return vulnerabilities
 
-    def _identify_callbacks(self, bytecode_analysis: Dict) -> None:
-        """
-        Identify callback functions in contract.
-        """
-        functions = bytecode_analysis.get('functions', [])
-        
-        for func in functions:
-            func_name = func.get('name', '').lower()
-            
-            if any(pattern in func_name for pattern in self.callback_patterns):
-                self.callback_functions.add(func_name)
-
-    def _find_callback_triggers(self, symbolic_results: Dict) -> None:
-        """
-        Find external calls that trigger callbacks.
-        """
+    def _identify_callback_triggers(self, symbolic_results: Dict) -> None:
         for path in symbolic_results.get('paths', []):
             for op in path.get('operations', []):
                 if op.get('type') != 'external_call':
@@ -91,159 +56,167 @@ class CallbackReentrancyAnalyzer:
                 
                 method = op.get('method', '').lower()
                 
-                # Check if this triggers a callback
-                if any(trigger in method for trigger in self.callback_triggers):
-                    self.external_calls.append({
+                if any(trigger in method for trigger in self.callback_triggers_methods):
+                    self.callback_triggers.append({
                         'method': method,
                         'target': op.get('target', ''),
                         'function': op.get('function'),
                         'location': op.get('location', {}),
-                        'triggers_callback': True,
-                        'operation_id': op.get('id')
+                        'is_safe_transfer': 'safe' in method
                     })
 
-    def _track_state_changes(self, symbolic_results: Dict) -> None:
-        """
-        Track state variable modifications.
-        """
+    def _identify_state_changes(self, symbolic_results: Dict) -> None:
         for path in symbolic_results.get('paths', []):
             for op in path.get('operations', []):
-                if op.get('type') == 'sstore':  # Storage write
+                if op.get('type') == 'sstore':
                     self.state_changes.append({
-                        'variable': op.get('variable'),
+                        'variable': op.get('variable', 'unknown'),
                         'function': op.get('function'),
                         'location': op.get('location', {}),
-                        'operation_id': op.get('id')
+                        'operation_index': op.get('index', 0)
                     })
 
-    def _analyze_reentrancy_patterns(self, cfg: Dict, 
-                                    symbolic_results: Dict) -> List[Dict]:
+    def _analyze_callback_flows(self, cfg: Dict, symbolic_results: Dict) -> None:
         """
-        Detect reentrancy patterns in callbacks.
+        Analyze if state is updated before or after callback-triggering calls.
         """
-        patterns = []
-        
-        # Pattern: State change AFTER callback-triggering call
-        for ext_call in self.external_calls:
-            if not ext_call['triggers_callback']:
+        for trigger in self.callback_triggers:
+            func_name = trigger['function']
+            
+            # Find state changes in same function
+            func_state_changes = [
+                sc for sc in self.state_changes 
+                if sc['function'] == func_name
+            ]
+            
+            if not func_state_changes:
                 continue
             
-            call_func = ext_call['function']
-            call_id = ext_call['operation_id']
+            # Analyze order: state change vs callback trigger
+            vulnerable = self._check_cei_pattern(trigger, func_state_changes, symbolic_results)
             
-            # Find state changes after this call
-            for path in symbolic_results.get('paths', []):
-                if path.get('function') != call_func:
-                    continue
-                
-                found_call = False
-                state_changes_after = []
-                
-                for op in path.get('operations', []):
-                    if op.get('id') == call_id:
-                        found_call = True
-                        continue
-                    
-                    # After the callback-triggering call
-                    if found_call and op.get('type') == 'sstore':
-                        state_changes_after.append(op)
-                
-                # If state changes occur after callback, it's vulnerable
-                if state_changes_after:
-                    patterns.append({
-                        'type': 'callback_reentrancy',
-                        'external_call': ext_call,
-                        'state_changes_after': state_changes_after,
-                        'function': call_func,
-                        'callback_method': ext_call['method']
-                    })
-        
-        return patterns
+            if vulnerable:
+                self.vulnerable_flows.append({
+                    'trigger': trigger,
+                    'state_changes': func_state_changes,
+                    'pattern': vulnerable
+                })
 
-    def _create_vulnerability(self, pattern: Dict) -> Vulnerability:
-        ext_call = pattern['external_call']
-        state_changes = pattern['state_changes_after']
-        method = ext_call['method']
+    def _check_cei_pattern(self, trigger: Dict, state_changes: List[Dict],
+                          symbolic_results: Dict) -> str:
+        """
+        Check if Checks-Effects-Interactions pattern is violated.
+        """
+        func_name = trigger['function']
         
-        poc = f"""// Callback Reentrancy: {method}
-// Real-world: Multiple NFT contracts vulnerable
+        # Find operation sequence
+        for path in symbolic_results.get('paths', []):
+            if path.get('function') != func_name:
+                continue
+            
+            ops = path.get('operations', [])
+            
+            # Find indices
+            callback_index = None
+            state_change_indices = []
+            
+            for i, op in enumerate(ops):
+                if op.get('method') == trigger['method']:
+                    callback_index = i
+                
+                if op.get('type') == 'sstore':
+                    state_change_indices.append(i)
+            
+            if callback_index is None:
+                continue
+            
+            # Check if any state changes happen AFTER callback
+            state_after_callback = any(idx > callback_index for idx in state_change_indices)
+            
+            if state_after_callback:
+                return 'state_after_callback'  # Vulnerable!
+        
+        return None
+
+    def _create_vulnerability(self, flow: Dict) -> Vulnerability:
+        trigger = flow['trigger']
+        method = trigger['method']
+        
+        # Determine token standard
+        if '721' in method:
+            standard = "ERC721"
+            callback = "onERC721Received"
+        elif '1155' in method:
+            standard = "ERC1155"
+            callback = "onERC1155Received"
+        else:
+            standard = "Token"
+            callback = "callback function"
+        
+        poc = f"""// Callback Reentrancy Attack ({standard})
 
 // Vulnerable contract:
-contract Vulnerable {{
-    mapping(address => uint256) public balances;
+function vulnerableFunction() public {{
+    // Step 1: Call {method} - triggers callback to attacker
+    nft.{method}(attacker, tokenId);
     
-    function withdraw() public {{
-        uint256 amount = balances[msg.sender];
-        
-        // VULNERABLE: External call before state update
-        nft.{method}(address(this), msg.sender, tokenId);
-        // ↑ This triggers onERC721Received callback in attacker's contract
-        
-        balances[msg.sender] = 0; // ← State update AFTER callback!
-    }}
+    // Step 2: State update AFTER callback (WRONG ORDER!)
+    userBalances[msg.sender] -= amount;
+    // But callback already executed with OLD state!
 }}
 
-// Attacker contract:
-contract Attacker {{
-    function onERC721Received(...) external returns (bytes4) {{
-        // Called DURING withdraw(), BEFORE balance is set to 0
-        if (victim.balances(address(this)) > 0) {{
-            victim.withdraw(); // Reentrancy!
-        }}
-        return this.onERC721Received.selector;
-    }}
+// Attacker's malicious contract:
+function {callback}(...) external returns (bytes4) {{
+    // Called DURING {method}, before state update
+    // State still shows old balance!
     
-    function attack() public {{
-        victim.deposit{{value: 1 ether}}();
-        victim.withdraw(); // Triggers reentrancy
-        // Balance is withdrawn multiple times before being set to 0
-    }}
+    // Reenter and exploit stale state
+    victim.anotherFunction();  // Uses old userBalances value
+    
+    return this.{callback}.selector;
 }}
 
 // Attack flow:
-// 1. Attacker calls withdraw()
-// 2. {method} is called, triggering onERC721Received
-// 3. In callback, attacker calls withdraw() again
-// 4. Balance still not updated, so second withdrawal succeeds
-// 5. Repeat until victim drained
+// 1. Attacker calls vulnerableFunction()
+// 2. Contract calls {method}() to attacker
+// 3. {callback}() executes with OLD state
+// 4. Attacker reenters, exploits stale state
+// 5. Original function finally updates state (too late!)
 
-// Fix: Update state BEFORE external call (Checks-Effects-Interactions)
-balances[msg.sender] = 0;
-nft.{method}(address(this), msg.sender, tokenId);
+// Fix - Checks-Effects-Interactions:
+function safe() public {{
+    // Update state BEFORE external call
+    userBalances[msg.sender] -= amount;
+    
+    // Then do external call
+    nft.{method}(attacker, tokenId);
+}}
 """
         
         return Vulnerability(
             type=VulnerabilityType.CALLBACK_REENTRANCY,
             severity=Severity.HIGH,
-            name=f"Callback Reentrancy via {method}",
-            description=f"Function {pattern['function']} calls {method} before updating state. "
-                       f"This triggers a callback where attacker can reenter. "
-                       f"{len(state_changes)} state changes occur AFTER the callback.",
+            name=f"{standard} Callback Reentrancy",
+            description=f"Function {trigger['function']} updates state AFTER calling {method}, "
+                       f"allowing reentrancy through {callback} callback",
             location=SourceLocation(
                 file="contract.sol",
-                line_start=ext_call.get('location', {}).get('line', 0),
-                line_end=ext_call.get('location', {}).get('line', 0),
-                function=pattern['function']
+                line_start=trigger.get('location', {}).get('line', 0),
+                line_end=trigger.get('location', {}).get('line', 0),
+                function=trigger['function']
             ),
-            confidence=0.82,
-            impact=f"Reentrancy through {method} callback allows attacker to drain contract funds. "
-                   f"State is updated after callback completes, enabling multiple withdrawals. "
-                   f"Vulnerable state variables: {[sc.get('variable') for sc in state_changes]}",
-            recommendation="Apply Checks-Effects-Interactions pattern: Update all state BEFORE external calls. "
-                         "OR use ReentrancyGuard from OpenZeppelin. "
-                         f"Move state updates before {method} call.",
+            confidence=0.78,
+            impact=f"Reentrancy during {standard} transfer callback. Attacker can manipulate state before updates complete. "
+                   f"Common with safe{standard} functions that trigger {callback}.",
+            recommendation="Apply Checks-Effects-Interactions pattern: "
+                         "1) Update all state BEFORE external calls, "
+                         "2) Add reentrancy guard (OpenZeppelin ReentrancyGuard), "
+                         "3) Use pull-over-push payment pattern.",
             exploit=Exploit(
-                description=f"Callback reentrancy via {method}",
-                attack_vector="Implement callback receiver, reenter during callback before state update",
-                profit_estimate=300000.0,
-                transaction_sequence=[
-                    {"step": 1, "action": "Attacker deposits funds into victim contract"},
-                    {"step": 2, "action": "Call function that triggers callback"},
-                    {"step": 3, "action": f"{method} triggers onERC721Received in attacker contract"},
-                    {"step": 4, "action": "During callback, reenter victim before state update"},
-                    {"step": 5, "action": "Repeat reentrancy to drain contract"}
-                ],
+                description=f"{standard} callback reentrancy",
+                attack_vector=f"Trigger {method} → reenter via {callback} → exploit stale state",
+                profit_estimate=150000.0,
                 proof_of_concept=poc
             ),
-            technical_details=pattern
+            technical_details=flow
         )

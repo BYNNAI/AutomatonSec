@@ -2,7 +2,7 @@
 # https://github.com/BYNNAI/AutomatonSec
 
 import logging
-from typing import Dict, List, Set
+from typing import Dict, List
 
 from src.core.models import Vulnerability, VulnerabilityType, Severity, SourceLocation, Exploit
 
@@ -12,181 +12,164 @@ logger = logging.getLogger(__name__)
 class UncheckedReturnAnalyzer:
     """
     Production-grade unchecked return value detector.
+    Real-world: Multiple protocols, silent ERC20 failures
     Target accuracy: 80-90%
-    
-    Detects silent failures in:
-    - ERC20 transfers
-    - External calls
-    - Low-level calls
     """
 
     def __init__(self):
+        self.external_calls: List[Dict] = []
         self.unchecked_calls: List[Dict] = []
         
-        # High-risk methods that MUST check return values
-        self.critical_methods = [
+        # Critical functions that must be checked
+        self.critical_functions = [
             'transfer', 'transferfrom', 'approve',
-            'call', 'delegatecall', 'staticcall',
-            'send'
+            'send', 'call', 'delegatecall',
+            'mint', 'burn', 'withdraw', 'deposit'
         ]
         
-        # ERC20 tokens known to return false instead of reverting
-        self.problematic_tokens = [
-            'usdt', 'bnb', 'zrx', 'omg'
-        ]
+        # ERC20 tokens known for non-reverting failures
+        self.known_noncompliant = ['usdt', 'bnb', 'omg', 'zrx']
 
     def detect(self, bytecode_analysis: Dict, cfg: Dict,
                 taint_results: Dict, symbolic_results: Dict,
                 fuzzing_results: Dict) -> List[Vulnerability]:
         vulnerabilities = []
         
-        # Phase 1: Find all external calls
-        external_calls = self._find_external_calls(symbolic_results)
+        self._identify_external_calls(symbolic_results)
+        self._identify_unchecked_returns(symbolic_results, cfg)
         
-        # Phase 2: Check which calls don't validate return values
-        for call in external_calls:
-            if self._is_unchecked(call, symbolic_results):
-                vuln = self._create_vulnerability(call)
-                vulnerabilities.append(vuln)
+        for unchecked in self.unchecked_calls:
+            vuln = self._create_vulnerability(unchecked)
+            vulnerabilities.append(vuln)
         
         return vulnerabilities
 
-    def _find_external_calls(self, symbolic_results: Dict) -> List[Dict]:
-        calls = []
-        
+    def _identify_external_calls(self, symbolic_results: Dict) -> None:
         for path in symbolic_results.get('paths', []):
             for op in path.get('operations', []):
-                if op.get('type') not in ['external_call', 'call']:
-                    continue
-                
-                method = op.get('method', '').lower()
-                
-                # Check if this is a critical method
-                if any(critical in method for critical in self.critical_methods):
-                    calls.append({
+                if op.get('type') in ['external_call', 'call', 'delegatecall']:
+                    method = op.get('method', '').lower()
+                    
+                    self.external_calls.append({
                         'method': method,
                         'target': op.get('target', ''),
                         'function': op.get('function'),
                         'location': op.get('location', {}),
-                        'returns_to': op.get('returns_to'),
-                        'operation_id': op.get('id')
+                        'returns': op.get('returns', False),
+                        'return_checked': op.get('return_checked', False),
+                        'is_critical': any(crit in method for crit in self.critical_functions)
                     })
-        
-        return calls
 
-    def _is_unchecked(self, call: Dict, symbolic_results: Dict) -> bool:
+    def _identify_unchecked_returns(self, symbolic_results: Dict, cfg: Dict) -> None:
+        for call in self.external_calls:
+            if not call['is_critical']:
+                continue
+            
+            # Check if return value is validated
+            is_checked = self._check_return_validation(call, symbolic_results, cfg)
+            
+            if not is_checked:
+                self.unchecked_calls.append(call)
+
+    def _check_return_validation(self, call: Dict, symbolic_results: Dict, cfg: Dict) -> bool:
         """
-        Determine if return value is checked.
+        Check if return value is properly validated.
         """
-        operation_id = call.get('operation_id')
-        returns_to = call.get('returns_to')
-        func = call.get('function')
+        func_name = call['function']
         
-        # If no return value captured, it's unchecked
-        if not returns_to:
-            return True
-        
-        # Check if return value is used in a require/assert/if statement
+        # Look for checks after the call
         for path in symbolic_results.get('paths', []):
-            if path.get('function') != func:
+            if path.get('function') != func_name:
                 continue
             
             found_call = False
-            for op in path.get('operations', []):
-                # Find our call
-                if op.get('id') == operation_id:
+            for i, op in enumerate(path.get('operations', [])):
+                # Find the external call
+                if op.get('method') == call['method']:
                     found_call = True
                     continue
                 
-                # After the call, check if return value is validated
-                if found_call:
-                    op_type = op.get('type', '')
-                    expr = op.get('expression', '').lower()
-                    condition = op.get('condition', '').lower()
+                # After finding call, look for require/revert checking return
+                if found_call and i < len(path['operations']) - 1:
+                    next_ops = path['operations'][i:i+3]  # Check next 3 operations
                     
-                    # Check for require/assert/revert
-                    if op_type in ['require', 'assert', 'revert']:
-                        if returns_to in expr or returns_to in condition:
-                            return False  # Return value IS checked
+                    for next_op in next_ops:
+                        op_type = next_op.get('type', '').lower()
+                        condition = next_op.get('condition', '').lower()
+                        
+                        # Check for require/assert/revert on return value
+                        if op_type in ['require', 'assert', 'revert']:
+                            if any(x in condition for x in ['success', 'return', 'result']):
+                                return True
                     
-                    # Check for if statement
-                    if op_type == 'if':
-                        if returns_to in condition:
-                            return False  # Return value IS checked
+                    # If we've checked next few ops and found nothing, it's unchecked
+                    break
         
-        # Return value not validated
-        return True
+        return False
 
     def _create_vulnerability(self, call: Dict) -> Vulnerability:
         method = call['method']
+        target = call['target']
         
-        # Determine severity based on method
-        if 'transfer' in method or 'approve' in method:
+        # Determine severity based on function type
+        if method in ['transfer', 'transferfrom']:
             severity = Severity.HIGH
-            impact_desc = "Silent ERC20 transfer failure. Funds may be lost without reverting."
-            profit_est = 100000.0
-        elif 'call' in method or 'delegatecall' in method:
-            severity = Severity.CRITICAL
-            impact_desc = "Silent call failure. Critical operations may fail without detection."
-            profit_est = 500000.0
-        else:
+            impact = "Silent ERC20 transfer failure. Funds appear sent but aren't. Accounting corruption."
+            example = "USDT"
+        elif method in ['approve']:
             severity = Severity.MEDIUM
-            impact_desc = "Unchecked return value may lead to unexpected behavior."
-            profit_est = 50000.0
+            impact = "Silent approval failure. User thinks allowance set but isn't. Subsequent operations fail."
+            example = "Some ERC20s"
+        elif 'call' in method:
+            severity = Severity.CRITICAL
+            impact = "Silent low-level call failure. Ether/data not sent. Critical logic bypass."
+            example = "address.call"
+        else:
+            severity = Severity.HIGH
+            impact = f"Silent {method} failure. Operation may fail without contract awareness."
+            example = method
         
-        poc = f"""// Unchecked Return Value: {method}
-// Real-world: Multiple fund losses
+        poc = f"""// Unchecked Return Value Attack
 
 // Vulnerable code:
-token.{method}(recipient, amount);
-// If transfer fails, contract continues as if it succeeded!
+token.{method}(recipient, amount);  // Return value ignored!
+// If transfer fails (e.g., USDT), code continues
+balances[user] -= amount;  // Balance updated even though transfer failed
+// Result: Accounting corruption, fund loss
 
-// Attack scenario for ERC20:
-// 1. Attacker uses non-reverting token (USDT, ZRX)
-// 2. Transfer fails (insufficient balance, frozen account)
-// 3. Contract doesn't detect failure
-// 4. Contract updates state as if transfer succeeded
-// 5. Attacker exploits incorrect state
-
-// Example exploit:
-function withdraw() {{
-    token.transfer(msg.sender, balance); // Unchecked!
-    balance[msg.sender] = 0; // State updated even if transfer failed
-    // Attacker got free balance reset without receiving tokens
-}}
+// Attack scenario:
+// 1. Attacker uses non-compliant token ({example})
+// 2. {method}() fails silently (no revert)
+// 3. Contract updates state assuming success
+// 4. Attacker gains credit without actual transfer
 
 // Fix:
-require(token.{method}(recipient, amount), "Transfer failed");
-// OR use SafeERC20:
-SafeERC20.safeTransfer(token, recipient, amount);
+bool success = token.{method}(recipient, amount);
+require(success, "Transfer failed");
+
+// Or use SafeERC20:
+using SafeERC20 for IERC20;
+token.safeTransfer(recipient, amount);  // Reverts on failure
 """
         
         return Vulnerability(
             type=VulnerabilityType.UNCHECKED_RETURN,
             severity=severity,
             name=f"Unchecked {method.title()} Return Value",
-            description=f"Function {call['function']} calls {method} without checking return value. "
-                       f"Some ERC20 tokens (USDT, ZRX) return false on failure instead of reverting.",
+            description=f"Function {call['function']} calls {method} without checking return value",
             location=SourceLocation(
                 file="contract.sol",
                 line_start=call.get('location', {}).get('line', 0),
                 line_end=call.get('location', {}).get('line', 0),
                 function=call['function']
             ),
-            confidence=0.88,
-            impact=impact_desc + f" Affects {len(self.problematic_tokens)} common tokens that don't revert on failure.",
-            recommendation=f"Add return value check: require({method}(...), \"Failed\"); "
-                         f"OR use OpenZeppelin SafeERC20 library for token operations.",
+            confidence=0.85,
+            impact=impact + f" Common with USDT, BNB, and other non-standard ERC20 tokens.",
+            recommendation=f"Check return value: require({method}(...), 'Failed'); or use OpenZeppelin SafeERC20 library.",
             exploit=Exploit(
                 description=f"Unchecked {method} exploitation",
-                attack_vector="Failed operation doesn't revert, contract continues with incorrect state",
-                profit_estimate=profit_est,
-                transaction_sequence=[
-                    {"step": 1, "action": f"Trigger {method} call that will fail"},
-                    {"step": 2, "action": "Call fails but returns false (no revert)"},
-                    {"step": 3, "action": "Contract updates state as if call succeeded"},
-                    {"step": 4, "action": "Exploit incorrect contract state for profit"}
-                ],
+                attack_vector=f"Use non-compliant token → {method} fails silently → accounting corruption",
+                profit_estimate=100000.0,
                 proof_of_concept=poc
             ),
             technical_details=call

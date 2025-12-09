@@ -12,155 +12,197 @@ logger = logging.getLogger(__name__)
 class GovernanceAttackAnalyzer:
     """
     Production-grade governance attack detector.
+    Real-world: Multiple protocols, flash loan voting manipulation
     Target accuracy: 65-75%
-    
-    Detects flash loan voting manipulation.
     """
 
     def __init__(self):
-        self.voting_functions: List[Dict] = []
-        self.flash_loan_calls: List[Dict] = []
+        self.vote_functions: List[Dict] = []
+        self.proposal_functions: List[Dict] = []
         self.token_transfers: List[Dict] = []
-        self.snapshot_checks: List[Dict] = []
+        self.flash_loans: List[Dict] = []
+        self.time_locks: List[Dict] = []
+        self.snapshots: List[Dict] = []
 
     def detect(self, bytecode_analysis: Dict, cfg: Dict,
                 taint_results: Dict, symbolic_results: Dict,
                 fuzzing_results: Dict) -> List[Vulnerability]:
         vulnerabilities = []
         
-        self._identify_voting_functions(bytecode_analysis)
+        self._identify_governance_functions(bytecode_analysis)
         self._identify_flash_loans(symbolic_results)
-        self._check_snapshot_mechanism(symbolic_results)
+        self._identify_time_locks(symbolic_results)
+        self._identify_snapshots(symbolic_results)
         
-        # Check if voting is vulnerable to flash loan attacks
-        if self.voting_functions and self.flash_loan_calls:
-            if not self._has_snapshot_protection():
-                vuln = self._create_flash_loan_voting_vuln()
-                vulnerabilities.append(vuln)
-        
-        # Check for time-lock bypass
-        timelock_vulns = self._check_timelock_bypass(symbolic_results)
-        vulnerabilities.extend(timelock_vulns)
+        vulnerabilities.extend(self._check_flash_loan_voting())
+        vulnerabilities.extend(self._check_snapshot_usage())
+        vulnerabilities.extend(self._check_proposal_execution())
+        vulnerabilities.extend(self._check_voting_power_delegation())
         
         return vulnerabilities
 
-    def _identify_voting_functions(self, bytecode_analysis: Dict) -> None:
+    def _identify_governance_functions(self, bytecode_analysis: Dict) -> None:
         functions = bytecode_analysis.get('functions', [])
-        
-        voting_keywords = ['vote', 'propose', 'castVote', 'delegate']
-        
         for func in functions:
-            func_name = func.get('name', '').lower()
-            if any(kw.lower() in func_name for kw in voting_keywords):
-                self.voting_functions.append(func)
+            name = func.get('name', '').lower()
+            if any(x in name for x in ['vote', 'cast']):
+                self.vote_functions.append(func)
+            elif any(x in name for x in ['propose', 'proposal', 'execute']):
+                self.proposal_functions.append(func)
 
     def _identify_flash_loans(self, symbolic_results: Dict) -> None:
         for path in symbolic_results.get('paths', []):
             for op in path.get('operations', []):
-                method = op.get('method', '').lower()
-                if 'flash' in method or 'borrow' in method:
-                    self.flash_loan_calls.append(op)
+                if op.get('type') == 'external_call':
+                    method = op.get('method', '').lower()
+                    if 'flash' in method or 'borrow' in method:
+                        self.flash_loans.append({
+                            'method': method,
+                            'function': op.get('function'),
+                            'location': op.get('location', {})
+                        })
 
-    def _check_snapshot_mechanism(self, symbolic_results: Dict) -> None:
+    def _identify_time_locks(self, symbolic_results: Dict) -> None:
         for path in symbolic_results.get('paths', []):
             for op in path.get('operations', []):
                 expr = op.get('expression', '').lower()
-                if 'snapshot' in expr or 'checkpoint' in expr:
-                    self.snapshot_checks.append(op)
+                if 'timestamp' in expr or 'delay' in expr or 'timelock' in expr:
+                    self.time_locks.append({
+                        'expression': expr,
+                        'function': op.get('function'),
+                        'type': op.get('type')
+                    })
 
-    def _has_snapshot_protection(self) -> bool:
-        return len(self.snapshot_checks) > 0
-
-    def _check_timelock_bypass(self, symbolic_results: Dict) -> List[Vulnerability]:
-        vulnerabilities = []
-        
-        # Check for execute functions without proper time-lock
+    def _identify_snapshots(self, symbolic_results: Dict) -> None:
         for path in symbolic_results.get('paths', []):
-            func = path.get('function', '').lower()
-            
-            if 'execute' in func or 'queue' in func:
-                has_timelock = False
+            for op in path.get('operations', []):
+                if 'snapshot' in op.get('expression', '').lower():
+                    self.snapshots.append({
+                        'function': op.get('function'),
+                        'location': op.get('location', {})
+                    })
+
+    def _check_flash_loan_voting(self) -> List[Vulnerability]:
+        vulns = []
+        
+        if self.flash_loans and self.vote_functions:
+            for vote_func in self.vote_functions:
+                func_name = vote_func.get('name')
                 
-                for op in path.get('operations', []):
-                    expr = op.get('expression', '').lower()
-                    if 'timestamp' in expr or 'delay' in expr:
-                        has_timelock = True
-                        break
+                # Check if flash loan and voting in same function
+                flash_in_vote = any(
+                    fl['function'] == func_name 
+                    for fl in self.flash_loans
+                )
                 
-                if not has_timelock:
-                    vuln = Vulnerability(
+                if flash_in_vote:
+                    poc = f"""// Flash Loan Governance Attack
+// 1. Flash loan voting tokens
+flashLender.flashLoan(votingToken, largeAmount);
+
+// 2. Vote with borrowed tokens
+governance.{func_name}(proposalId, support);
+
+// 3. Proposal passes with manipulated votes
+// 4. Return flash loan tokens
+votingToken.transfer(flashLender, largeAmount);
+
+// Result: Attacker controls governance without owning tokens
+"""
+                    vulns.append(Vulnerability(
                         type=VulnerabilityType.GOVERNANCE_ATTACK,
-                        severity=Severity.HIGH,
-                        name="Missing Timelock Protection",
-                        description=f"Function {func} lacks timelock delay",
+                        severity=Severity.CRITICAL,
+                        name="Flash Loan Voting Manipulation",
+                        description=f"Function {func_name} allows voting with flash-borrowed tokens",
                         location=SourceLocation(
                             file="contract.sol",
-                            line_start=0,
-                            line_end=0,
-                            function=func
+                            line_start=vote_func.get('line_start', 0),
+                            line_end=vote_func.get('line_end', 0),
+                            function=func_name
                         ),
-                        confidence=0.75,
-                        impact="Proposals can be executed immediately without delay",
-                        recommendation="Add timelock delay (e.g., 2 days) before execution"
-                    )
-                    vulnerabilities.append(vuln)
+                        confidence=0.88,
+                        impact="Attacker can pass malicious proposals by flash-borrowing voting tokens. Protocol takeover possible.",
+                        recommendation="Implement snapshot-based voting: record voting power at proposal creation block, not voting block. Use OpenZeppelin Governor with snapshots.",
+                        exploit=Exploit(
+                            description="Flash loan governance takeover",
+                            attack_vector="Flash borrow → vote → pass proposal → return tokens",
+                            profit_estimate=5000000.0,
+                            proof_of_concept=poc
+                        )
+                    ))
         
-        return vulnerabilities
+        return vulns
 
-    def _create_flash_loan_voting_vuln(self) -> Vulnerability:
-        poc = """// Flash Loan Governance Attack
-// Real-world: Multiple protocols affected
-
-// 1. Flash loan governance tokens
-flashLoan(governanceToken, largeAmount);
-
-// 2. Delegate voting power to self
-token.delegate(address(this));
-
-// 3. Create and vote on malicious proposal
-governance.propose(maliciousAction);
-governance.castVote(proposalId, true);
-
-// 4. Execute proposal (if no timelock)
-governance.execute(proposalId);
-
-// 5. Return flash loan
-token.transfer(lender, largeAmount);
-
-// Result: Malicious proposal passed and executed
-// No actual token ownership required!
-"""
+    def _check_snapshot_usage(self) -> List[Vulnerability]:
+        vulns = []
         
-        return Vulnerability(
-            type=VulnerabilityType.GOVERNANCE_ATTACK,
-            severity=Severity.CRITICAL,
-            name="Flash Loan Governance Manipulation",
-            description=f"Voting system vulnerable to flash loan attacks. {len(self.voting_functions)} voting functions without snapshot protection.",
-            location=SourceLocation(
-                file="contract.sol",
-                line_start=0,
-                line_end=0,
-                function="governance"
-            ),
-            confidence=0.82,
-            impact="Attacker can pass malicious proposals using flash-loaned tokens without actual ownership. Treasury drain, parameter changes, or protocol takeover possible.",
-            recommendation="Implement snapshot-based voting (check voting power at specific block), add timelock delays (2+ days), require minimum holding period before voting.",
-            exploit=Exploit(
-                description="Flash loan governance takeover",
-                attack_vector="Flash loan → acquire voting power → pass malicious proposal → return tokens",
-                profit_estimate=2000000.0,
-                transaction_sequence=[
-                    {"step": 1, "action": "Flash loan governance tokens"},
-                    {"step": 2, "action": "Delegate voting power"},
-                    {"step": 3, "action": "Create and vote on malicious proposal"},
-                    {"step": 4, "action": "Execute proposal (if no timelock)"},
-                    {"step": 5, "action": "Return flash loan with fee"}
-                ],
-                proof_of_concept=poc
-            ),
-            technical_details={
-                'voting_functions': len(self.voting_functions),
-                'flash_loan_calls': len(self.flash_loan_calls),
-                'has_snapshot': self._has_snapshot_protection()
-            }
-        )
+        if self.vote_functions and not self.snapshots:
+            vulns.append(Vulnerability(
+                type=VulnerabilityType.GOVERNANCE_ATTACK,
+                severity=Severity.HIGH,
+                name="No Snapshot-Based Voting",
+                description=f"Governance has {len(self.vote_functions)} voting functions but no snapshot mechanism",
+                location=SourceLocation(file="contract.sol", line_start=0, line_end=0),
+                confidence=0.75,
+                impact="Vulnerable to flash loan voting attacks. Voting power can be manipulated.",
+                recommendation="Implement ERC20Snapshot or record voting power at proposal creation."
+            ))
+        
+        return vulns
+
+    def _check_proposal_execution(self) -> List[Vulnerability]:
+        vulns = []
+        
+        for prop_func in self.proposal_functions:
+            func_name = prop_func.get('name', '').lower()
+            
+            # Check if execution has time lock
+            if 'execute' in func_name:
+                has_timelock = any(
+                    tl['function'] == prop_func.get('name')
+                    for tl in self.time_locks
+                )
+                
+                if not has_timelock:
+                    vulns.append(Vulnerability(
+                        type=VulnerabilityType.GOVERNANCE_ATTACK,
+                        severity=Severity.HIGH,
+                        name="No Time Lock on Proposal Execution",
+                        description=f"Function {prop_func.get('name')} executes proposals without time delay",
+                        location=SourceLocation(
+                            file="contract.sol",
+                            line_start=prop_func.get('line_start', 0),
+                            line_end=prop_func.get('line_end', 0),
+                            function=prop_func.get('name')
+                        ),
+                        confidence=0.82,
+                        impact="Malicious proposals can execute immediately. No time for community response.",
+                        recommendation="Add time lock: minimum 24-48h delay between proposal passage and execution."
+                    ))
+        
+        return vulns
+
+    def _check_voting_power_delegation(self) -> List[Vulnerability]:
+        vulns = []
+        
+        # Check for delegation without safeguards
+        for vote_func in self.vote_functions:
+            source = vote_func.get('source_code', '')
+            if 'delegate' in source.lower():
+                if 'snapshot' not in source.lower():
+                    vulns.append(Vulnerability(
+                        type=VulnerabilityType.GOVERNANCE_ATTACK,
+                        severity=Severity.MEDIUM,
+                        name="Unsafe Delegation Pattern",
+                        description=f"Function {vote_func.get('name')} allows delegation without snapshot",
+                        location=SourceLocation(
+                            file="contract.sol",
+                            line_start=vote_func.get('line_start', 0),
+                            line_end=vote_func.get('line_end', 0)
+                        ),
+                        confidence=0.70,
+                        impact="Delegation can be manipulated to gain voting power.",
+                        recommendation="Use snapshot-based delegation tracking."
+                    ))
+        
+        return vulns

@@ -2,8 +2,8 @@
 # https://github.com/BYNNAI/AutomatonSec
 
 import logging
+from typing import Dict, List
 import re
-from typing import Dict, List, Tuple, Optional
 
 from src.core.models import Vulnerability, VulnerabilityType, Severity, SourceLocation, Exploit
 
@@ -13,26 +13,19 @@ logger = logging.getLogger(__name__)
 class UnsafeCastAnalyzer:
     """
     Production-grade unsafe type cast detector.
+    Real-world: Silent overflows in downcasts (uint256 → uint128)
     Target accuracy: 75-85%
-    
-    Detects overflow in:
-    - uint256 → uint128/uint64/uint32
-    - int256 → int128/int64
-    - address → uint160 → address (precision loss)
     """
 
     def __init__(self):
-        self.cast_operations: List[Dict] = []
+        self.casts: List[Dict] = []
         
-        # Risky downcast patterns
+        # Dangerous downcast patterns
         self.downcast_patterns = [
-            (r'uint256.*uint128', 'uint256', 'uint128', 128),
-            (r'uint256.*uint64', 'uint256', 'uint64', 192),
-            (r'uint256.*uint32', 'uint256', 'uint32', 224),
-            (r'uint256.*uint16', 'uint256', 'uint16', 240),
-            (r'uint256.*uint8', 'uint256', 'uint8', 248),
-            (r'uint128.*uint64', 'uint128', 'uint64', 64),
-            (r'int256.*int128', 'int256', 'int128', 128),
+            (r'uint256.*uint(\d+)', 256),
+            (r'int256.*int(\d+)', 256),
+            (r'uint128.*uint(\d+)', 128),
+            (r'int128.*int(\d+)', 128),
         ]
 
     def detect(self, bytecode_analysis: Dict, cfg: Dict,
@@ -40,194 +33,150 @@ class UnsafeCastAnalyzer:
                 fuzzing_results: Dict) -> List[Vulnerability]:
         vulnerabilities = []
         
-        # Phase 1: Identify type cast operations
         self._identify_casts(symbolic_results, bytecode_analysis)
         
-        # Phase 2: Analyze each cast for overflow risk
-        for cast in self.cast_operations:
-            if self._is_unsafe_downcast(cast):
-                # Phase 3: Check if overflow protection exists
-                if not self._has_overflow_protection(cast, symbolic_results):
-                    vuln = self._create_vulnerability(cast)
-                    vulnerabilities.append(vuln)
+        for cast in self.casts:
+            if cast['is_unsafe']:
+                vuln = self._create_vulnerability(cast)
+                vulnerabilities.append(vuln)
         
         return vulnerabilities
 
-    def _identify_casts(self, symbolic_results: Dict, 
-                       bytecode_analysis: Dict) -> None:
-        """
-        Identify all type casting operations.
-        """
-        # Check source code for explicit casts
-        source = bytecode_analysis.get('source_code', '')
-        
-        for line_num, line in enumerate(source.split('\n'), 1):
-            for pattern, from_type, to_type, bits_lost in self.downcast_patterns:
-                if re.search(pattern, line, re.IGNORECASE):
-                    self.cast_operations.append({
-                        'from_type': from_type,
-                        'to_type': to_type,
-                        'bits_lost': bits_lost,
-                        'line': line_num,
-                        'code': line.strip(),
-                        'pattern': pattern
-                    })
-        
-        # Also check symbolic execution for cast operations
+    def _identify_casts(self, symbolic_results: Dict, bytecode_analysis: Dict) -> None:
+        # Check symbolic execution results
         for path in symbolic_results.get('paths', []):
             for op in path.get('operations', []):
-                if op.get('type') == 'cast':
-                    self.cast_operations.append({
-                        'from_type': op.get('from_type', 'unknown'),
-                        'to_type': op.get('to_type', 'unknown'),
-                        'function': op.get('function'),
-                        'location': op.get('location', {}),
-                        'expression': op.get('expression', '')
-                    })
-
-    def _is_unsafe_downcast(self, cast: Dict) -> bool:
-        """
-        Determine if cast is a risky downcast.
-        """
-        from_type = cast.get('from_type', '').lower()
-        to_type = cast.get('to_type', '').lower()
-        
-        # Extract bit sizes
-        from_bits = self._extract_bit_size(from_type)
-        to_bits = self._extract_bit_size(to_type)
-        
-        # Downcast if target type is smaller
-        return to_bits < from_bits
-
-    def _extract_bit_size(self, type_str: str) -> int:
-        """
-        Extract bit size from type string.
-        """
-        # Extract number from type (e.g., uint256 → 256)
-        match = re.search(r'\d+', type_str)
-        if match:
-            return int(match.group())
-        
-        # Default sizes
-        if 'uint' in type_str or 'int' in type_str:
-            return 256  # Default Solidity int size
-        elif 'address' in type_str:
-            return 160
-        
-        return 256  # Conservative default
-
-    def _has_overflow_protection(self, cast: Dict, 
-                                symbolic_results: Dict) -> bool:
-        """
-        Check if cast has overflow protection (require/assert).
-        """
-        cast_line = cast.get('line')
-        cast_func = cast.get('function')
-        
-        # Look for require/assert near the cast
-        for path in symbolic_results.get('paths', []):
-            if cast_func and path.get('function') != cast_func:
-                continue
-            
-            for op in path.get('operations', []):
-                op_location = op.get('location', {})
-                op_line = op_location.get('line', 0)
+                expr = op.get('expression', '')
                 
-                # Check operations within 5 lines of cast
-                if cast_line and abs(op_line - cast_line) <= 5:
-                    op_type = op.get('type', '')
-                    condition = op.get('condition', '').lower()
+                # Look for cast patterns
+                cast_info = self._parse_cast(expr)
+                if cast_info:
+                    cast_info['function'] = op.get('function')
+                    cast_info['location'] = op.get('location', {})
                     
-                    # Look for overflow checks
-                    if op_type in ['require', 'assert']:
-                        # Common overflow check patterns
-                        overflow_checks = [
-                            'max', 'type(uint', 'overflow',
-                            '<=', '<', 'safe'
-                        ]
-                        
-                        if any(check in condition for check in overflow_checks):
-                            return True
+                    # Check if cast has overflow protection
+                    has_check = self._has_overflow_check(op, path)
+                    cast_info['is_unsafe'] = not has_check
+                    
+                    self.casts.append(cast_info)
+        
+        # Also check source code for type conversions
+        source = bytecode_analysis.get('source_code', '')
+        for match in re.finditer(r'uint(\d+)\s*\(', source):
+            target_bits = int(match.group(1))
+            if target_bits < 256:
+                self.casts.append({
+                    'from_type': 'uint256',
+                    'to_type': f'uint{target_bits}',
+                    'from_bits': 256,
+                    'to_bits': target_bits,
+                    'is_unsafe': True,  # Assume unsafe unless proven otherwise
+                    'location': {'line': source[:match.start()].count('\n') + 1}
+                })
+
+    def _parse_cast(self, expr: str) -> Dict:
+        """
+        Parse cast expression to extract type information.
+        """
+        expr_lower = expr.lower()
+        
+        for pattern, from_bits in self.downcast_patterns:
+            match = re.search(pattern, expr_lower)
+            if match:
+                to_bits = int(match.group(1)) if match.groups() else 0
+                
+                if to_bits < from_bits:
+                    return {
+                        'expression': expr,
+                        'from_bits': from_bits,
+                        'to_bits': to_bits,
+                        'from_type': f'uint{from_bits}' if 'uint' in pattern else f'int{from_bits}',
+                        'to_type': f'uint{to_bits}' if 'uint' in pattern else f'int{to_bits}',
+                        'overflow_possible': True
+                    }
+        
+        return None
+
+    def _has_overflow_check(self, operation: Dict, path: Dict) -> bool:
+        """
+        Check if cast has overflow protection.
+        """
+        # Look for require/assert before or after cast
+        ops = path.get('operations', [])
+        op_index = ops.index(operation) if operation in ops else -1
+        
+        if op_index == -1:
+            return False
+        
+        # Check surrounding operations
+        check_range = ops[max(0, op_index-2):min(len(ops), op_index+3)]
+        
+        for check_op in check_range:
+            if check_op.get('type') in ['require', 'assert']:
+                condition = check_op.get('condition', '').lower()
+                # Look for overflow checks like: require(value <= type(uint128).max)
+                if any(x in condition for x in ['max', 'overflow', '<=', '<']):
+                    return True
         
         return False
 
     def _create_vulnerability(self, cast: Dict) -> Vulnerability:
-        from_type = cast.get('from_type', 'uint256')
-        to_type = cast.get('to_type', 'uint128')
-        bits_lost = cast.get('bits_lost', 128)
+        from_type = cast['from_type']
+        to_type = cast['to_type']
+        from_bits = cast['from_bits']
+        to_bits = cast['to_bits']
         
-        # Calculate maximum safe value
-        max_safe = (2 ** (256 - bits_lost)) - 1
+        max_safe = (2 ** to_bits) - 1
         
-        poc = f"""// Unsafe Downcast: {from_type} → {to_type}
-// Loses {bits_lost} bits of precision
+        poc = f"""// Unsafe Type Cast Overflow
 
 // Vulnerable code:
-{from_type} largeValue = 2**200; // Large number
-{to_type} smallValue = {to_type}(largeValue); // Overflow!
-// smallValue is now truncated, not the original value
+uint256 largeValue = 2**200;  // Larger than uint128.max
+uint128 smallValue = uint128(largeValue);  // UNCHECKED CAST!
+// Result: smallValue = (2**200) % (2**128) = unexpected value
+// Overflow is silent, no revert!
 
-// Example exploit:
-contract Vulnerable {{
-    mapping(address => uint256) public balances;
-    
-    function withdraw(uint256 amount) public {{
-        require(balances[msg.sender] >= amount);
-        
-        // Unsafe cast
-        uint128 amount128 = uint128(amount);
-        
-        // If amount > 2^128, amount128 wraps around
-        // e.g., 2^128 + 100 becomes 100
-        
-        token.transfer(msg.sender, amount128); // Sends truncated amount
-        balances[msg.sender] -= amount; // Deducts full amount!
-        
-        // Attacker withdrawn small amount but balance reduced by large amount
-    }}
-}}
+// Real-world scenario:
+uint256 totalSupply = 1e30;  // Common for 18-decimal tokens
+uint128 packed = uint128(totalSupply);  // Silently overflows
+// packed now contains wrong value, breaking calculations
 
 // Attack:
-// 1. Attacker has balance of 2^128 + 1000
-// 2. Calls withdraw(2^128 + 1000)
-// 3. Cast truncates to 1000
-// 4. Only 1000 tokens transferred
-// 5. But full 2^128 + 1000 deducted from balance
-// 6. Attacker repeats to drain more than they deposited
+// 1. Manipulate value to be > {max_safe} ({to_type}.max)
+// 2. Cast silently truncates to fit in {to_bits} bits
+// 3. Resulting value is wrong, breaks logic
+// 4. Exploit incorrect calculations
 
-// Fix:
-require(amount <= type(uint128).max, "Overflow");
-uint128 amount128 = uint128(amount);
+// Fix Option 1 - Require:
+require(value <= type({to_type}).max, "Overflow");
+{to_type} safe = {to_type}(value);
+
+// Fix Option 2 - SafeCast library:
+using SafeCast for uint256;
+{to_type} safe = value.to{to_type.title()}();  // Reverts on overflow
 """
         
         return Vulnerability(
             type=VulnerabilityType.UNSAFE_CAST,
             severity=Severity.HIGH,
             name=f"Unsafe Downcast: {from_type} → {to_type}",
-            description=f"Unchecked type cast from {from_type} to {to_type} loses {bits_lost} bits. "
-                       f"Values > {max_safe} will silently overflow.",
+            description=f"Type downcast from {from_type} ({from_bits} bits) to {to_type} ({to_bits} bits) without overflow check",
             location=SourceLocation(
                 file="contract.sol",
-                line_start=cast.get('line', 0),
-                line_end=cast.get('line', 0),
+                line_start=cast.get('location', {}).get('line', 0),
+                line_end=cast.get('location', {}).get('line', 0),
                 function=cast.get('function', 'unknown')
             ),
-            confidence=0.85,
-            impact=f"Silent integer overflow. Values exceeding {to_type} max will wrap around, "
-                   f"leading to incorrect calculations. Can enable fund theft through balance manipulation.",
-            recommendation=f"Add overflow check before cast: "
-                         f"require(value <= type({to_type}).max, \"Overflow\"); "
-                         f"OR use OpenZeppelin SafeCast library: {to_type} safe = value.toUint{256-bits_lost}();",
+            confidence=0.82,
+            impact=f"Silent overflow when value > {max_safe} ({to_type}.max). "
+                   f"Leads to incorrect calculations, fund loss, or logic bypass. "
+                   f"Especially dangerous with token amounts (commonly uint256).",
+            recommendation=f"Add overflow check: require(value <= type({to_type}).max, 'Overflow'); "
+                         f"or use OpenZeppelin SafeCast library: value.to{to_type.title()}();",
             exploit=Exploit(
-                description=f"Downcast overflow {from_type} → {to_type}",
-                attack_vector=f"Provide value > 2^{256-bits_lost}, cast silently truncates to smaller value",
+                description=f"Type downcast overflow {from_type} → {to_type}",
+                attack_vector=f"Manipulate value > {max_safe} → cast silently truncates → wrong value → exploit",
                 profit_estimate=250000.0,
-                transaction_sequence=[
-                    {"step": 1, "action": f"Provide {from_type} value > type({to_type}).max"},
-                    {"step": 2, "action": f"Cast silently truncates to {to_type}"},
-                    {"step": 3, "action": "Contract uses truncated value for critical operation"},
-                    {"step": 4, "action": "Exploit difference between original and truncated value"}
-                ],
                 proof_of_concept=poc
             ),
             technical_details=cast

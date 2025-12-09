@@ -2,7 +2,7 @@
 # https://github.com/BYNNAI/AutomatonSec
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List
 from collections import defaultdict
 
 from src.core.models import Vulnerability, VulnerabilityType, Severity, SourceLocation, Exploit
@@ -13,23 +13,21 @@ logger = logging.getLogger(__name__)
 class PriceManipulationAnalyzer:
     """
     Production-grade price manipulation detector.
+    Real-world: $2.47B stolen in H1 2025, 80% of DeFi exploits
     Target accuracy: 70-80%
-    
-    Real-world impact: $2.47B stolen in H1 2025
     """
 
     def __init__(self):
-        self.spot_price_queries: List[Dict] = []
-        self.flash_loan_calls: List[Dict] = []
+        self.price_queries: List[Dict] = []
+        self.flash_loans: List[Dict] = []
         self.dex_interactions: List[Dict] = []
         
         self.spot_price_methods = [
-            'getamountout', 'getreserves', 'balanceof', 
-            'getprice', 'currentprice'
+            'getamountout', 'getamountin', 'getreserves', 'quote',
+            'getprice', 'getspotprice', 'balanceof', 'reserve0', 'reserve1'
         ]
-        
         self.safe_methods = ['latestrounddata', 'consult', 'observe', 'gettwap']
-        self.dex_protocols = ['uniswap', 'sushiswap', 'balancer', 'curve']
+        self.dex_protocols = ['uniswap', 'sushiswap', 'balancer', 'curve', 'pancakeswap']
 
     def detect(self, bytecode_analysis: Dict, cfg: Dict,
                 taint_results: Dict, symbolic_results: Dict,
@@ -40,16 +38,9 @@ class PriceManipulationAnalyzer:
         self._identify_flash_loans(symbolic_results)
         self._identify_dex_interactions(symbolic_results)
         
-        # Spot price vulnerabilities
-        for query in self.spot_price_queries:
-            if self._is_vulnerable_spot_price(query):
-                vuln = self._create_spot_price_vuln(query)
-                vulnerabilities.append(vuln)
-        
-        # Flash loan manipulation
-        if self.flash_loan_calls and self.spot_price_queries:
-            vuln = self._create_flash_loan_vuln()
-            vulnerabilities.append(vuln)
+        vulnerabilities.extend(self._analyze_spot_price_usage())
+        vulnerabilities.extend(self._analyze_flash_loan_attacks(symbolic_results))
+        vulnerabilities.extend(self._check_twap_usage())
         
         return vulnerabilities
 
@@ -58,120 +49,118 @@ class PriceManipulationAnalyzer:
             for op in path.get('operations', []):
                 if op.get('type') != 'external_call':
                     continue
-                
                 method = op.get('method', '').lower()
                 target = op.get('target', '').lower()
                 
-                is_spot = any(m in method for m in self.spot_price_methods)
-                is_safe = any(m in method for m in self.safe_methods)
-                
-                if is_spot and not is_safe:
-                    self.spot_price_queries.append({
-                        'method': method,
-                        'target': target,
-                        'function': op.get('function'),
-                        'location': op.get('location', {}),
-                        'dex': self._identify_dex(target)
+                if any(pm in method for pm in self.spot_price_methods):
+                    self.price_queries.append({
+                        'method': method, 'target': target,
+                        'function': op.get('function'), 'location': op.get('location', {}),
+                        'is_spot': not any(safe in method for safe in self.safe_methods),
+                        'dex_type': next((dex for dex in self.dex_protocols if dex in target), 'unknown')
                     })
 
     def _identify_flash_loans(self, symbolic_results: Dict) -> None:
         for path in symbolic_results.get('paths', []):
             for op in path.get('operations', []):
-                method = op.get('method', '').lower()
-                if 'flash' in method or 'borrow' in method:
-                    self.flash_loan_calls.append(op)
+                if op.get('type') == 'external_call':
+                    method = op.get('method', '').lower()
+                    if any(x in method for x in ['flashloan', 'flash', 'borrow']):
+                        self.flash_loans.append({
+                            'method': method, 'function': op.get('function'),
+                            'location': op.get('location', {})
+                        })
 
     def _identify_dex_interactions(self, symbolic_results: Dict) -> None:
         for path in symbolic_results.get('paths', []):
             for op in path.get('operations', []):
+                if op.get('type') != 'external_call':
+                    continue
                 method = op.get('method', '').lower()
-                target = op.get('target', '').lower()
-                
-                if 'swap' in method or any(dex in target for dex in self.dex_protocols):
-                    self.dex_interactions.append(op)
+                if any(x in method for x in ['swap', 'addliquidity', 'removeliquidity']):
+                    self.dex_interactions.append({
+                        'method': method, 'function': op.get('function')
+                    })
 
-    def _identify_dex(self, target: str) -> str:
-        for dex in self.dex_protocols:
-            if dex in target:
-                return dex
-        return 'unknown'
-
-    def _is_vulnerable_spot_price(self, query: Dict) -> bool:
-        # High risk: balance or reserve queries
-        method = query['method']
-        return 'reserve' in method or 'balance' in method or 'getamount' in method
-
-    def _create_spot_price_vuln(self, query: Dict) -> Vulnerability:
-        dex = query['dex'].title()
-        
-        poc = f"""// Spot Price Manipulation: {dex}
-// Real-world: $2.47B losses in H1 2025
-
-// 1. Flash loan large amount
-flashLoan(1000000 ether);
-
-// 2. Manipulate {dex} pool
-{dex}.swap(largeAmount, 0, this, "");
-
-// 3. Query manipulated price
-uint price = victim.{query['method']}(); // Inflated!
-
-// 4. Exploit (liquidate, borrow, etc)
-victim.exploit(price);
-
-// 5. Restore and profit
+    def _analyze_spot_price_usage(self) -> List[Vulnerability]:
+        vulns = []
+        for query in self.price_queries:
+            if not query['is_spot']:
+                continue
+            
+            confidence = 0.40 if 'reserve' in query['method'] else 0.25
+            confidence += 0.20 if query['dex_type'] != 'unknown' else 0
+            
+            if confidence >= 0.45:
+                poc = f"""// Spot Price Manipulation ({query['dex_type'].title()})
+flashLender.flashLoan(amount);
+{query['dex_type']}Pair.swap(amount, 0, address(this), "");
+uint256 manipulated = victim.{query['method']}();
+victim.exploit(manipulated);
+{query['dex_type']}Pair.swap(0, amount, address(this), "");
 """
-        
-        return Vulnerability(
-            type=VulnerabilityType.PRICE_MANIPULATION,
-            severity=Severity.CRITICAL,
-            name=f"{dex} Spot Price Manipulation",
-            description=f"Uses {query['method']} which is manipulatable via flash loans",
-            location=SourceLocation(
-                file="contract.sol",
-                line_start=query.get('location', {}).get('line', 0),
-                line_end=query.get('location', {}).get('line', 0),
-                function=query['function']
-            ),
-            confidence=0.85,
-            impact=f"Price manipulation. Pattern caused $2.47B losses. {dex} reserves manipulatable.",
-            recommendation="Use TWAP oracle (Uniswap V3 observe()) or Chainlink instead of spot prices",
-            exploit=Exploit(
-                description=f"{dex} price manipulation",
-                attack_vector="Flash loan → manipulate reserves → exploit",
-                profit_estimate=500000.0,
-                proof_of_concept=poc
-            ),
-            technical_details=query
-        )
+                vulns.append(Vulnerability(
+                    type=VulnerabilityType.PRICE_MANIPULATION,
+                    severity=Severity.CRITICAL,
+                    name=f"{query['dex_type'].title()} Spot Price Manipulation",
+                    description=f"Function {query['function']} uses spot price {query['method']}",
+                    location=SourceLocation(
+                        file="contract.sol",
+                        line_start=query.get('location', {}).get('line', 0),
+                        line_end=query.get('location', {}).get('line', 0),
+                        function=query['function']
+                    ),
+                    confidence=confidence,
+                    impact=f"Flash loan manipulation. $2.47B pattern (H1 2025). {query['dex_type']} reserves manipulable.",
+                    recommendation="Use TWAP: Uniswap V3 observe(), Chainlink feeds, or 30+ min observation window.",
+                    exploit=Exploit(
+                        description=f"{query['dex_type']} price manipulation",
+                        attack_vector="Flash loan → manipulate reserves → query price → exploit",
+                        profit_estimate=500000.0,
+                        proof_of_concept=poc
+                    )
+                ))
+        return vulns
 
-    def _create_flash_loan_vuln(self) -> Vulnerability:
-        poc = """// Flash Loan + Price Manipulation
-// Borrow → Manipulate DEX → Query Price → Exploit
+    def _analyze_flash_loan_attacks(self, symbolic_results: Dict) -> List[Vulnerability]:
+        vulns = []
+        for flash in self.flash_loans:
+            func = flash['function']
+            price_queries_in_func = [q for q in self.price_queries if q['function'] == func]
+            dex_interactions_in_func = [d for d in self.dex_interactions if d['function'] == func]
+            
+            if price_queries_in_func and dex_interactions_in_func:
+                vulns.append(Vulnerability(
+                    type=VulnerabilityType.PRICE_MANIPULATION,
+                    severity=Severity.CRITICAL,
+                    name="Flash Loan Price Manipulation Pattern",
+                    description=f"Function {func} combines flash loan + {len(dex_interactions_in_func)} DEX ops + {len(price_queries_in_func)} price queries",
+                    location=SourceLocation(
+                        file="contract.sol",
+                        line_start=flash.get('location', {}).get('line', 0),
+                        line_end=flash.get('location', {}).get('line', 0),
+                        function=func
+                    ),
+                    confidence=0.92,
+                    impact="Complete price manipulation capability during flash loan.",
+                    recommendation="Use TWAP oracles, not spot prices during flash execution."
+                ))
+        return vulns
 
-function attack() {
-    flashLoan(amount);
-    // During loan: manipulate prices
-    dex.swap(...); // Skew reserves
-    uint price = getPrice(); // Query manipulated
-    exploit(price); // Profit
-    repay();
-}
-"""
+    def _check_twap_usage(self) -> List[Vulnerability]:
+        vulns = []
+        spot_count = sum(1 for q in self.price_queries if q['is_spot'])
+        twap_count = sum(1 for q in self.price_queries if not q['is_spot'])
         
-        return Vulnerability(
-            type=VulnerabilityType.PRICE_MANIPULATION,
-            severity=Severity.CRITICAL,
-            name="Flash Loan Price Manipulation Pattern",
-            description=f"Flash loans with {len(self.spot_price_queries)} spot price queries",
-            location=SourceLocation(file="contract.sol", line_start=0, line_end=0, function="multiple"),
-            confidence=0.88,
-            impact="Complete price manipulation via flash loans",
-            recommendation="Use TWAP oracles, not spot prices",
-            exploit=Exploit(
-                description="Flash loan manipulation",
-                attack_vector="Flash loan enables price manipulation",
-                profit_estimate=1000000.0,
-                proof_of_concept=poc
-            )
-        )
+        if spot_count > 0 and twap_count == 0:
+            vulns.append(Vulnerability(
+                type=VulnerabilityType.PRICE_MANIPULATION,
+                severity=Severity.CRITICAL,
+                name="No TWAP Oracle Usage",
+                description=f"Contract uses {spot_count} spot price queries, zero TWAP",
+                location=SourceLocation(file="contract.sol", line_start=0, line_end=0),
+                confidence=0.88,
+                impact="All price queries vulnerable to flash loan manipulation.",
+                recommendation="Replace spot with TWAP: Uniswap V3 observe() or Chainlink."
+            ))
+        return vulns
