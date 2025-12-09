@@ -13,7 +13,15 @@ from .unsafe_cast_analyzer import UnsafeCastAnalyzer
 from .callback_reentrancy_analyzer import CallbackReentrancyAnalyzer
 from .rounding_error_analyzer import RoundingErrorAnalyzer
 
+# NEW: 5 stub detectors upgraded to production
+from .stale_price_analyzer import StalePriceAnalyzer
+from .donation_attack_analyzer import DonationAttackAnalyzer
+from .sandwich_attack_analyzer import SandwichAttackAnalyzer
+from .oracle_analyzer import OracleAnalyzer
+from .jit_liquidity_analyzer import JITLiquidityAnalyzer
+
 __all__ = [
+    # Original 9 production detectors
     'VaultInflationAnalyzer',
     'ReadOnlyReentrancyAnalyzer',
     'StorageCollisionAnalyzer',
@@ -23,4 +31,11 @@ __all__ = [
     'UnsafeCastAnalyzer',
     'CallbackReentrancyAnalyzer',
     'RoundingErrorAnalyzer',
+    
+    # NEW: 5 upgraded detectors
+    'StalePriceAnalyzer',        # 75-85%
+    'DonationAttackAnalyzer',    # 65-75%
+    'SandwichAttackAnalyzer',    # 60-70%
+    'OracleAnalyzer',            # 70-80%
+    'JITLiquidityAnalyzer',      # 60-70%
 ]
